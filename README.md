@@ -13,7 +13,7 @@ The project currently consists of the following components:
 
 ### Pipeline
 
-![image/png](assests/pipeline.png)
+![image/png](assets/pipeline.png)
 
 The training process consists of three major stages: **synthetic data generation, supervised training, and reinforcement learning (RL) training**. Each of these stages plays a crucial role in improving the model’s ability to perform structured information extraction.
 
@@ -36,6 +36,10 @@ Supervised training alone does not fully solve the problem, especially when it c
 * **Format reward** ensures that the output follows a structured format, where thinking is encapsulated in a respective tag (in the case of thinking mode).
 * **JSON reward** specifically validates well-formed, machine-readable JSON representations and that its structure aligns with the desirable format.
 * **F1 reward** evaluates the accuracy of extracted entities and relations by comparing them to ground truth graphs.
+
+Below you can see how different rewards change through training steps from one of our experiments.
+
+![image/png](assets/rewards.png)
 
 
 ### Try Model
