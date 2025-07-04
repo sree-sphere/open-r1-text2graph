@@ -84,30 +84,36 @@ def main(args):
     
     model_path = args.model_path
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Fix device mapping issue
+    if torch.cuda.is_available():
+        device_map = "auto"
+    else:
+        device_map = None
 
     if QUANTIZE:
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_use_double_quant=False,
             bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype="float16",
+            bnb_4bit_compute_dtype=torch.float16,
         )
     else:
         bnb_config = None
 
+    # Load model with proper device mapping
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        device_map=device,
-        # torch_dtype=torch.bfloat16,
+        device_map=device_map,
+        torch_dtype=torch.float16 if args.fp16 else torch.bfloat16 if args.bf16 else None,
         quantization_config=bnb_config,
         trust_remote_code=True,
         token=args.hf_token,
-        # attn_implementation="flash_attention_2"
+        # attn_implementation="flash_attention_2"  # Uncomment if you have flash attention installed
     )
 
     if USE_LORA:
         modules = find_all_linear_names(model, quantize=QUANTIZE)
+        logger.info(f"LoRA target modules: {modules}")
 
         peft_config = LoraConfig(
             lora_alpha=32,
@@ -123,7 +129,7 @@ def main(args):
     model.config.use_cache = False
     model.config.pretraining_tp = 1
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, token=args.hf_token)
     tokenizer.pad_token_id = tokenizer.eos_token_id
     # tokenizer.chat_template = CHAT_TEMPLATE
 
@@ -158,6 +164,8 @@ def main(args):
         eval_strategy="steps",
         eval_steps=args.eval_steps,
         save_steps=args.save_steps,
+        dataloader_pin_memory=False,  # Can help with memory issues
+        remove_unused_columns=False,  # Keep all columns
     )
 
     trainer = SFTTrainer(
@@ -166,7 +174,9 @@ def main(args):
         train_dataset=train_dataset,
         eval_dataset=test_dataset,
         peft_config=peft_config,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,  # Use processing_class instead of tokenizer
+        max_seq_length=args.max_length,
+        packing=False,  # Don't pack sequences
     )
 
     trainer.train()
