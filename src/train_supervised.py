@@ -3,6 +3,7 @@ import json
 import copy
 import logging
 import argparse
+import random
 from tqdm import tqdm
 
 import bitsandbytes as bnb
@@ -34,44 +35,45 @@ class Text2JSONDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.dataset[idx]
-        chat = item['prompt']
-
+        user_chat = item['prompt']
         output = item['solution']
 
-        chat.extend([
-            {"role": "assistant", "content": str(output)}
-        ])
+        # Build full conversation
+        full_chat = copy.deepcopy(user_chat)
+        full_chat.append({"role": "assistant", "content": str(output)})
 
-        input_ = self.tokenizer.apply_chat_template(
-            chat,
-            tokenize=False,
-            add_generation_prompt=False
-        )
+        # Tokenize user part and full conversation
+        user_input = self.tokenizer.apply_chat_template(user_chat, tokenize=False)
+        full_input = self.tokenizer.apply_chat_template(full_chat, tokenize=False)
 
-        inputs = self.tokenizer(
-            input_, return_tensors="pt", max_length=self.max_length, truncation=True, padding='max_length'
-        )
+        user_inputs = self.tokenizer(user_input, return_tensors="pt", truncation=True, padding=False)
+        full_inputs = self.tokenizer(full_input, return_tensors="pt", max_length=self.max_length, 
+                                   truncation=True, padding='max_length')
 
-        input_ids = inputs["input_ids"].squeeze(0)
-        attention_mask = inputs["attention_mask"].squeeze(0)
-        labels_ids = input_ids.clone().squeeze(0)
+        user_input_ids = user_inputs["input_ids"].squeeze(0)
+        full_input_ids = full_inputs["input_ids"].squeeze(0)
+        attention_mask = full_inputs["attention_mask"].squeeze(0)
+
+        # Mask user tokens in labels
+        labels = full_input_ids.clone()
+        labels[:user_input_ids.shape[0]] = -100  # Mask user part
+        labels[attention_mask.squeeze() == 0] = -100  # Mask padding
 
         return {
-            'input_ids': input_ids,
+            'input_ids': full_input_ids,
             'attention_mask': attention_mask,
-            'labels': labels_ids
+            'labels': labels
         }
 
 # Helper function to find linear module names
 def find_all_linear_names(model, quantize=False):
     cls = bnb.nn.Linear4bit if quantize else torch.nn.Linear
-
     lora_module_names = set()
     for name, module in model.named_modules():
         if isinstance(module, cls):
             names = name.split('.')
             lora_module_names.add(names[0] if len(names) == 1 else names[-1])
-    if 'lm_head' in lora_module_names:  # needed for 16 bit
+    if 'lm_head' in lora_module_names:
         lora_module_names.remove('lm_head')
     return list(lora_module_names)
 
@@ -79,28 +81,30 @@ def find_all_linear_names(model, quantize=False):
 def main(args):
     logger.info("Starting script with configuration: %s", args)
 
+    # Validate inputs
+    if not os.path.exists(args.model_path):
+        raise FileNotFoundError(f"Model path {args.model_path} does not exist.")
+    if not os.path.exists(args.data_path):
+        raise FileNotFoundError(f"Data path {args.data_path} does not exist.")
+    if args.fp16 and args.bf16:  # needed for 16 bit
+        raise ValueError("Cannot enable both FP16 and BF16. Choose one.")
+
     QUANTIZE = args.quantize
     USE_LORA = args.use_lora
-    
     model_path = args.model_path
 
-    # Fix device mapping issue
-    if torch.cuda.is_available():
-        device_map = "auto"
-    else:
-        device_map = None
+    # Device setup
+    device_map = "auto" if torch.cuda.is_available() else None
 
-    if QUANTIZE:
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_use_double_quant=False,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16,
-        )
-    else:
-        bnb_config = None
+    # Quantization config
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=False,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,
+    ) if QUANTIZE else None
 
-    # Load model with proper device mapping
+    # Model loading
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         device_map=device_map,
@@ -108,13 +112,17 @@ def main(args):
         quantization_config=bnb_config,
         trust_remote_code=True,
         token=args.hf_token,
-        # attn_implementation="flash_attention_2"  # Uncomment if you have flash attention installed
+        attn_implementation="flash_attention_2" if args.use_flash_attention else None
     )
 
+    # Gradient checkpointing
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+
+    # LoRA setup
     if USE_LORA:
         modules = find_all_linear_names(model, quantize=QUANTIZE)
         logger.info(f"LoRA target modules: {modules}")
-
         peft_config = LoraConfig(
             lora_alpha=32,
             lora_dropout=0.1,
@@ -133,15 +141,21 @@ def main(args):
     tokenizer.pad_token_id = tokenizer.eos_token_id
     # tokenizer.chat_template = CHAT_TEMPLATE
 
+    # Load and shuffle data
     with open(args.data_path, encoding='utf-8') as f:
         data = json.load(f)
-    train_data = data[:int(len(data)*0.8)]
-    test_data = data[int(len(data)*0.8):]
+    random.seed(args.seed)
+    random.shuffle(data)
+    split = int(len(data) * 0.8)
+    train_data = data[:split]
+    test_data = data[split:]
+    
     train_dataset = Text2JSONDataset(train_data, tokenizer, max_length=args.max_length)
     test_dataset = Text2JSONDataset(test_data, tokenizer, max_length=args.max_length)
 
     logger.info("Dataset lengths - Train: %d, Test: %d", len(train_dataset), len(test_dataset))
 
+    # Training arguments
     training_arguments = TrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.num_train_epochs,
@@ -157,35 +171,39 @@ def main(args):
         max_grad_norm=args.max_grad_norm,
         max_steps=args.max_steps,
         warmup_ratio=args.warmup_ratio,
-        group_by_length=False,
+        group_by_length=True,
         lr_scheduler_type=args.lr_scheduler_type,
         save_total_limit=3,
-        report_to="none",
+        report_to="tensorboard" if args.log_dir else "none",
+        logging_dir=args.log_dir,
         eval_strategy="steps",
         eval_steps=args.eval_steps,
         save_steps=args.save_steps,
-        dataloader_pin_memory=False,  # Can help with memory issues
-        remove_unused_columns=False,  # Keep all columns
+        dataloader_pin_memory=False,
+        remove_unused_columns=False,
     )
 
+    # Initialize trainer
     trainer = SFTTrainer(
         model=model,
         args=training_arguments,
         train_dataset=train_dataset,
         eval_dataset=test_dataset,
         peft_config=peft_config,
-        processing_class=tokenizer,  # Use processing_class instead of tokenizer
+        processing_class=tokenizer,
         max_seq_length=args.max_length,
-        packing=False,  # Don't pack sequences
+        packing=False,
     )
 
     trainer.train()
 
+    # Save merged model if using LoRA
     if peft_config is not None:
-        logger.info("Merging LoRA weights into the base model (since use_lora=True).")
+        logger.info("Merging LoRA weights into the base model.")
         trainer.model = trainer.model.merge_and_unload()
-        trainer.model.save_pretrained(os.path.join(args.output_dir, 'merged'))
-        tokenizer.save_pretrained(os.path.join(args.output_dir, 'merged'))
+        merged_path = os.path.join(args.output_dir, 'merged')
+        trainer.model.save_pretrained(merged_path)
+        tokenizer.save_pretrained(merged_path)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Text2JSON Dataset Training Script")
@@ -193,7 +211,7 @@ if __name__ == "__main__":
     parser.add_argument('--model_path', type=str, required=True, help="Path to the model.")
     parser.add_argument('--data_path', type=str, required=True, help="Path to the training dataset.")
     parser.add_argument('--output_dir', type=str, required=True, help="Directory to save trained models.")
-    parser.add_argument('--hf_token', type=str, required=False, help="Hugging Face authentication token.")
+    parser.add_argument('--hf_token', type=str, required=False, default=None, help="Hugging Face authentication token.")
     parser.add_argument('--max_length', type=int, default=4096, help="Maximum sequence length.")
     parser.add_argument('--num_train_epochs', type=int, default=2, help="Number of training epochs.")
     parser.add_argument('--batch_size', type=int, default=2, help="Training batch size.")
@@ -212,6 +230,9 @@ if __name__ == "__main__":
     parser.add_argument('--save_steps', type=int, default=1000, help="Save steps.")
     parser.add_argument('--quantize', action='store_true', help="Enable quantization.")
     parser.add_argument('--use_lora', action='store_true', help="Enable LoRA training.")
+    parser.add_argument('--use_flash_attention', action='store_true', help="Enable Flash Attention")
+    parser.add_argument('--log_dir', type=str, default=None, help="TensorBoard logging directory")
+    parser.add_argument('--seed', type=int, default=42, help="Random seed for data splitting")
 
     args = parser.parse_args()
 
